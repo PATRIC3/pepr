@@ -17,6 +17,7 @@ import org.json.simple.JSONObject;
 import edu.vt.vbi.ci.pepr.alignment.BlastRunner;
 import edu.vt.vbi.ci.pepr.alignment.BlatRunner;
 import edu.vt.vbi.ci.pepr.stats.StatisticsUtilities;
+import edu.vt.vbi.ci.pepr.tree.AdvancedTree;
 import edu.vt.vbi.ci.pepr.tree.BasicTree;
 import edu.vt.vbi.ci.pepr.tree.PhylogeneticTreeRefiner;
 import edu.vt.vbi.ci.util.CommandLineProperties;
@@ -46,6 +47,7 @@ import edu.vt.vbi.ci.util.file.TextFile;
  */
 public class PhyloPipeline {
 
+	private static final int MINIMUM_GENOME_COUNT = 4;
 
 	private static Logger logger;
 	private static HashMap<String,String> commands;
@@ -103,7 +105,7 @@ public class PhyloPipeline {
 		String logfile = clp.getValues("logfile", runName+".log")[0];
 		//set log file name, based on run name, if it has not already been set
 		System.setProperty("logfile.name",System.getProperty("logfile.name", logfile));
-//		logger = Logger.getLogger("PEPR");
+		//		logger = Logger.getLogger("PEPR");
 		logger.info("Starting " + new Date());
 		System.out.println("logger configured with log file name '" + System.getProperty("logfile.name"));
 		System.out.println("logger: " + logger);
@@ -116,7 +118,30 @@ public class PhyloPipeline {
 								clp.getValues("?", 
 										HandyConstants.FALSE)[0].equals(HandyConstants.TRUE);
 
-		setCommandPaths();
+
+		boolean useInstalledThirdPartyBinaries = true;
+		if(clp.getValues(HandyConstants.PATRIC, HandyConstants.FALSE)[0].equals(HandyConstants.TRUE)) {
+			FastaUtilities.setStripPipeAndSuffix(false);
+			writeJSON = true;
+			useInstalledThirdPartyBinaries = false;
+		}
+
+		useInstalledThirdPartyBinaries = clp.getValues(HandyConstants.USE_INSTALLED_THIRD_PARTY_BINARIES, ""+useInstalledThirdPartyBinaries)[0].equalsIgnoreCase(HandyConstants.TRUE);
+
+		if(useInstalledThirdPartyBinaries) {
+			System.out.println("using pre-installed binaries for third-party tools");
+			setCommandPaths();
+		} else {
+			System.out.println("using system binaries for third-party tools");
+			//check for specific version of muscle, and use if it is present
+			String muscleVersion = "muscle-3.6";
+			String fullCommandPath = ExecUtilities.getCommandPath(muscleVersion);
+			if(fullCommandPath != null && fullCommandPath.length() > 0) {
+				logger.info("set path for '" + muscleVersion + "' to '" + fullCommandPath + "'" );
+				System.setProperty("muscle", fullCommandPath);
+			}
+
+		}
 
 		//check for required programs
 		checkForRequiredPrograms();
@@ -172,11 +197,6 @@ public class PhyloPipeline {
 			logger.log(Level.DEBUG,e.getMessage());
 		}
 
-		if(clp.getValues(HandyConstants.PATRIC, HandyConstants.FALSE)[0].equals(HandyConstants.TRUE)) {
-			FastaUtilities.setStripPipeAndSuffix(false);
-			writeJSON = true;
-		}
-		
 		//Determine number of Threads to use. By default, every thread parameter
 		//will be set to the number of processors available.
 		int maxThreads = Runtime.getRuntime().availableProcessors();
@@ -231,7 +251,7 @@ public class PhyloPipeline {
 			e.printStackTrace();
 			logger.log(Level.DEBUG,e.getMessage());
 		}
-		
+
 		PEPRTracker.setInputSequenceFiles(inputSequenceFiles);
 
 		//find out if blast/blat searches should use only a single member
@@ -254,6 +274,10 @@ public class PhyloPipeline {
 		if(uniqueSpecies) {
 			homologySearchSequenceFiles = 
 					filterOutDuplicateSpecies(homologySearchSequenceFiles);
+			if(homologySearchSequenceFiles.length < MINIMUM_GENOME_COUNT) {
+				System.out.println("There are not enough unique species to use the unique species filter, so all genomes will be used.");
+				homologySearchSequenceFiles = inputSequenceFiles;
+			}
 			Arrays.sort(homologySearchSequenceFiles);
 		} else if(uniqueGenus) {
 			homologySearchSequenceFiles = 
@@ -496,10 +520,24 @@ public class PhyloPipeline {
 		}
 
 		PEPRTracker.setTree(getTree());
-		printTreeAndOutgroupFile();
+
+		try {
+			printTreeAndOutgroupFile();
+		} catch (IOException e2) {
+			System.out.println("There was a problem writing the tree and outgroup (*.tog) output file: ");
+			e2.printStackTrace();
+		}
+
+		try {
+			printRootedFinalTree();
+		} catch (IOException e1) {
+			System.out.println("There was a problem writing the final rooted tree output files: ");
+			e1.printStackTrace();
+		}
+
 		if(writeJSON) {
 			try {
-				printJSONTree();
+				printJSONTreeAndMetadata();
 			} catch (IOException e) {
 				System.out.println("There was a problem writing the PATRIC json output file: ");
 				e.printStackTrace();
@@ -507,16 +545,39 @@ public class PhyloPipeline {
 		}
 	}
 
-	private void printJSONTree() throws IOException {
+	private void printJSONTreeAndMetadata() throws IOException {
 		String newickTree = getTree();
-		String jsonTree = newickToPATRICJSON(newickTree, selectedOutgroupGenomes, "unknown", "unknown");
+		AdvancedTree tree = new AdvancedTree(newickTree);
+		tree.setOutGroup(getSelectedOutgroupGenomes());
+		String rootedNewickTree = tree.getTreeString(true, true);
+		String jsonTree = newickToPATRICJSON(rootedNewickTree, getSelectedOutgroupGenomes(), "unknown", "unknown");
 		String jsonFileName = runName + ".json";
 		logger.info("writing json output to file " + jsonFileName);
 		FileWriter fw = new FileWriter(jsonFileName);
 		fw.write(jsonTree);
 		fw.close();
+
+
 	}
-	
+
+	private void printRootedFinalTree() throws IOException {
+		String newickTree = getTree();
+		AdvancedTree tree = new AdvancedTree(newickTree);
+		tree.setOutGroup(getSelectedOutgroupGenomes());
+		String rootedNewickTree = tree.getTreeString(true, true);
+		String rootedNewickFileName = runName + "_final_rooted.nwk";
+
+		FileWriter fw = new FileWriter(rootedNewickFileName);
+		fw.write(rootedNewickTree);
+		fw.close();
+
+		String rootedJSONFileName = runName + "_final_rooted.json";
+		String rootedJSONTree = tree.getTreeJSON();
+		fw = new FileWriter(rootedJSONFileName);
+		fw.write(rootedJSONTree);
+		fw.close();
+	}
+
 	private static String newickToPATRICJSON(String newickTree, String[] outgroupGenomes, String taxonName, String taxonRank) {
 		String r = null;
 		String delimiter = "_@_";
@@ -525,24 +586,30 @@ public class PhyloPipeline {
 		String idOnlyNewick = newickTree;
 		BasicTree tree = new BasicTree(newickTree);
 		String[] leaves = tree.getLeaves();
+		ArrayList<String> idList = new ArrayList<String>(leaves.length);
 		HashMap<String,String> nameToId = new HashMap<String,String>();
 		HashSet<String> outgroup = new HashSet<String>();
 		for(String og: outgroupGenomes) {
 			String[] parts = og.split(delimiter);
 			outgroup.add(parts[nameIndex].replaceAll("_", " "));
 		}
-		
+
+		JSONObject labelJSON = new JSONObject();
 		//verify that leaves are in <genome_name>@<genome_id> format
 		//extract genome name and genome id to make map
 		//replace leaves with just genome id
 		for(String leaf: leaves) {
 			if(leaf.contains(delimiter)) {
 				String[] parts = leaf.split(delimiter);
+				String name = parts[nameIndex].replaceAll("_", " "); 
+				String id = parts[idIndex];
 				idOnlyNewick = idOnlyNewick.replaceFirst(leaf, parts[idIndex]);
-				nameToId.put(parts[nameIndex].replaceAll("_", " "), parts[idIndex]);
+				nameToId.put(name, id);
+				labelJSON.put(id,name);
+				idList.add(id);
 			}
 		}
-		
+
 		JSONObject outgroupJSON = new JSONObject();
 		String[] names = outgroup.toArray(new String[0]);
 		Arrays.sort(names);
@@ -550,53 +617,41 @@ public class PhyloPipeline {
 			String id = nameToId.get(name);
 			outgroupJSON.put(id,name);
 		}
-		
+
 		JSONObject infoJSON = new JSONObject();
 		infoJSON.put("outgroups", outgroupJSON);
-	
+
 		String genomeCount = "" + (leaves.length - outgroupGenomes.length);
 		infoJSON.put("count", genomeCount);
-		
+
 		infoJSON.put("taxon_name", taxonName);
 		infoJSON.put("taxon_rank", taxonRank);
-
-		JSONObject labelJSON = new JSONObject();
-		names = nameToId.keySet().toArray(new String[0]);
-		Arrays.sort(names);
-		for(String name: names) {
-			String id = nameToId.get(name);
-			labelJSON.put(id,name);
-		}
+		infoJSON.put("ids", idList);
 
 		JSONObject fullJSON = new JSONObject();
 		fullJSON.put("info", infoJSON);
 		fullJSON.put("labels", labelJSON);
 		fullJSON.put("tree", idOnlyNewick);
-//		System.out.println(idOnlyNewick);
+		//		System.out.println(idOnlyNewick);
 		r = fullJSON.toJSONString();
-//		System.out.println(r);
+		//		System.out.println(r);
 		return r;
 	}
 
-	private void printTreeAndOutgroupFile() {
+	private void printTreeAndOutgroupFile() throws IOException {
 		String fileName = runName + ".tog";
-		try {
-			String[] outgroups = getSelectedOutgroupGenomes();
-			FileWriter fw = new FileWriter(fileName);
-			fw.write("trees[\'" + runName + "\'] = \""+ getTree() + "\";\n");
-			if(outgroups != null && outgroups.length > 0) {
-				fw.write("outgroups[\'" + runName + "\'] = [\"" + outgroups[0] + "\"");
-				for(int i = 1; i < outgroups.length; i++) {
-					fw.write(", \"" + outgroups[i] + "\"");
-				}
-				fw.write("];\n");
+		String[] outgroups = getSelectedOutgroupGenomes();
+		FileWriter fw = new FileWriter(fileName);
+		fw.write("trees[\'" + runName + "\'] = \""+ getTree() + "\";\n");
+		if(outgroups != null && outgroups.length > 0) {
+			fw.write("outgroups[\'" + runName + "\'] = [\"" + outgroups[0] + "\"");
+			for(int i = 1; i < outgroups.length; i++) {
+				fw.write(", \"" + outgroups[i] + "\"");
 			}
-			fw.flush();
-			fw.close();
-		} catch (IOException e) {
-			e.printStackTrace();
+			fw.write("];\n");
 		}
-
+		fw.flush();
+		fw.close();
 	}
 
 	private void setTree(String tree) {
@@ -773,8 +828,18 @@ public class PhyloPipeline {
 		for(int i = 0; i < commands.length; i++) {
 			String fullCommandPath = binDirName + commands[i];
 			logger.info("set path for '" + commands[i] + "' to '" + fullCommandPath + "'" );
+			System.out.println("set path for '" + commands[i] + "' to '" + fullCommandPath + "'" );
 			System.setProperty(commands[i], fullCommandPath);
 		}
+
+		//check for specific version of muscle, and use if it is present
+		String muscleVersion = "muscle-3.6";
+		String fullCommandPath = ExecUtilities.getCommandPath(muscleVersion);
+		if(fullCommandPath != null && fullCommandPath.length() > 0) {
+			logger.info("set path for '" + muscleVersion + "' to '" + fullCommandPath + "'" );
+			System.setProperty("muscle", fullCommandPath);
+		}
+
 	}
 
 	private TextFile runMCL(TextFile hitPairFile, String inflation, int threads) {
@@ -1039,7 +1104,7 @@ public class PhyloPipeline {
 					"1", 
 			};
 		}
-		
+
 		r = propertyLines.toArray(new String[0]);
 		return r;
 	}
@@ -1109,8 +1174,8 @@ public class PhyloPipeline {
 				"Provide an optional run name for. Output files will contain this name, making it easier to track the results. If no run name is provided, one will be automatically generated.");
 		commands.put(HandyConstants.MIN_TAXA_MULTIPLIER, 
 				"Proportion of max_taxa to be used as a minimum taxa value. Sequence sets with fewer taxa are not included in tree building. Default is 0.8");
-//		commands.put(HandyConstants.TRACK, "\tSpecify a pre-defined track (set of options) to use. Tracks are identified by the sequence similarity search program used and the tree-building program used. Track options are:\n" +
-//				"\t\t\t\t\t\tblat_fast\n\t\t\t\t\t\tblast_fast\n\t\t\t\t\t\tblat_raxml\n\t\t\t\t\t\tblast_raxml");
+		//		commands.put(HandyConstants.TRACK, "\tSpecify a pre-defined track (set of options) to use. Tracks are identified by the sequence similarity search program used and the tree-building program used. Track options are:\n" +
+		//				"\t\t\t\t\t\tblat_fast\n\t\t\t\t\t\tblast_fast\n\t\t\t\t\t\tblat_raxml\n\t\t\t\t\t\tblast_raxml");
 	}
 
 	/**
@@ -1133,7 +1198,7 @@ public class PhyloPipeline {
 		logger.info("Check for required programs...");
 		String[] requiredPrograms = new String[]{
 				"blastall",
-//				"blat",
+				//				"blat",
 				"formatdb",
 				"FastTree",
 				"FastTree_WAG",
@@ -1142,6 +1207,7 @@ public class PhyloPipeline {
 				"hmmsearch",
 				"mcl",
 				"muscle",
+				"muscle-3.6",
 				"raxmlHPC",
 				"raxmlHPC-PTHREADS"
 		};
